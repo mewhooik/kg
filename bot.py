@@ -1,642 +1,427 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# khan_bot.py
+# Khan Global Studies - Telegram Bot (Strict & Clean)
+# ✅ No Auto-Reply Loop | ✅ Strict Input | ✅ Clean Menu | ✅ Thumbnail Links
 
-"""
-🎬 KDLIVE EXTRACTOR BOT — FINAL FIXED VERSION
-✅ ID*Password or userid|token
-✅ Course buttons
-✅ HTML-safe truncation — no "unclosed tag" errors
-✅ Fixed URLs — no trailing spaces
-✅ Better error handling — API errors, message edit errors
-✅ Extract videos + PDFs
-✅ Send TXT file on Telegram
-"""
-
-import os, re, time, hashlib, traceback, requests, urllib3
-from html import escape
+import requests
+import json
+import gzip
+import zlib
+import re
+import os
+import asyncio
+import tempfile
+import traceback
 from datetime import datetime
+from collections import defaultdict
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters,
+from pyrogram import Client, filters, enums
+from pyrogram.errors import FloodWait, RPCError
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# ================== CONFIG ==================
+API_ID = int(os.getenv("API_ID", "29136894"))
+API_HASH = os.getenv("API_HASH", "88f3d07b70de48ac1fc13866b0c9e562")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8634130308:AAGRbg2475S8YvmfZfY5QH2cw6wklfkpMdo")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003887045145"))
+OWNER_ID = int(os.getenv("OWNER_ID", "7566796700"))
+# ============================================
+
+app = Client(
+    "khan_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    workers=50,
+    sleep_threshold=60
 )
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# ─────────────────────────────────────────────────────
-# 🎨 Terminal Colors
-# ─────────────────────────────────────────────────────
-G, R, C, Y, W, B = "\033[92m", "\033[91m", "\033[96m", "\033[93m", "\033[0m", "\033[1m"
-
-# ─────────────────────────────────────────────────────
-# ⚙️ CONFIG — FIXED: NO TRAILING SPACES IN URLs ✅
-# ─────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-# ✅ BASE_URL: NO trailing spaces
-BASE_URL = "https://web.kdcampus.live"
-
-# ✅ Endpoint URLs: NO trailing spaces (fixed!)
-LOGIN_URL = f"{BASE_URL}/android/Usersn/login_user"
-COURSES_URL = f"{BASE_URL}/android/Dashboard/get_mycourse_data_renew_new"
-SUBJECTS_URL = f"{BASE_URL}/android/Dashboard/course_subject"
-VIDEOS_URL = f"{BASE_URL}/android/Dashboard/course_details_video"
-PDFS_URL = f"{BASE_URL}/android/Dashboard/course_details_pdf"
-
-IMAGE_BASE = "http://kdcampus.live/uploaded/landing_images/"
-API_KEY = "kdc123"
-
+API_BASE = "https://api.khanglobalstudies.com"
+APP_BASE = "https://app.khanglobalstudies.com"
 HEADERS = {
-    "User-Agent": "okhttp/4.10.0",
-    "Accept-Encoding": "gzip",
-    "Content-Type": "application/json; charset=UTF-8",
-    "Accept": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "identity",
+    "Origin": APP_BASE,
+    "Referer": APP_BASE + "/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "sec-ch-ua": '"Not A(Brand";v="99", "Google Chrome";v="121"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
 }
 
-USERS = {}
+user_sessions = {}
 
-# ─────────────────────────────────────────────────────
-# 🧩 HTML HELPERS
-# ─────────────────────────────────────────────────────
-def h(text):
-    return escape(str(text if text is not None else ""))
+# ================== HELPERS ==================
+def fix_thumb(url):
+    if not url: return None
+    if url.startswith('/'): return f"{APP_BASE}{url}"
+    return url if url.startswith('http') else None
 
-def pre_box(text):
-    return f"<pre>{h(text)}</pre>"
+def smart_decompress(content):
+    if not content: return ""
+    if isinstance(content, str): return content
+    if content[:2] == b'\x1f\x8b':
+        try: return gzip.decompress(content).decode('utf-8', errors='ignore')
+        except: pass
+    if content[:2] in [b'\x78\x9c', b'\x78\x01', b'\x78\xda']:
+        try: return zlib.decompress(content).decode('utf-8', errors='ignore')
+        except: pass
+    try: return content.decode('utf-8', errors='ignore')
+    except: return content.decode('latin-1', errors='ignore')
 
-def quote_box(text):
-    return f"<blockquote>{text}</blockquote>"
+def get_short_subject(name):
+    if not name: return "Course"
+    for s in [" By Khan Sir", " By Khan", " By Team", "& Team"]:
+        if s in name: name = name.split(s)[0].strip()
+    if "(" in name: name = name.split("(")[0].strip()
+    if " & " in name: name = name.split(" & ")[0].strip()
+    skip = {'the','and','by','for','with','in','on','at','to','of'}
+    words = [w for w in name.split() if w.lower() not in skip]
+    return (words[0] if words else name[:20]).rstrip(' -:')
 
-def safe_thumb_url(image_name):
-    if not image_name:
-        return ""
-    return IMAGE_BASE + str(image_name)
+def clean_title(title, batch):
+    if not title: return "Untitled"
+    result = title.strip()
+    subj = get_short_subject(batch).lower()
+    for p in [rf'{re.escape(subj)}\s+by\s+khan\s+sir\s*[-–:]\s*', rf'{re.escape(subj)}\s*[-–:]\s*', rf'khan\s+sir\s*[-–:]\s*', rf'{re.escape(batch)}\s*[-–:]\s*']:
+        result = re.sub(p, "", result, flags=re.I).strip()
+    return re.sub(r'\s+', ' ', re.sub(r'\s+[-–:]\s*', ' ', result).strip()) or title.strip()
 
-# ─────────────────────────────────────────────────────
-# ✂️ HTML-SAFE TRUNCATION — FIXED ✅
-# ─────────────────────────────────────────────────────
-def safe_truncate_html(html_text, max_len=3800, suffix="\n\n<i>...truncated</i>"):
-    if len(html_text) <= max_len:
-        return html_text
-    
-    cut_point = html_text.rfind("</blockquote>", 0, max_len)
-    if cut_point == -1:
-        cut_point = html_text.rfind("\n\n", 0, max_len)
-    if cut_point == -1:
-        cut_point = max_len
-    
-    truncated = html_text[:cut_point]
-    
-    open_tags = []
-    for tag in ['<b>', '<i>', '<u>', '<s>', '<blockquote>', '<a href']:
-        open_count = truncated.count(tag)
-        close_tag = tag.replace('<', '</').replace(' href', '').replace('>', '') + '>'
-        close_count = truncated.count(close_tag)
-        if open_count > close_count:
-            open_tags.append(close_tag)
-    
-    for close_tag in reversed(open_tags):
-        truncated += close_tag
-    
-    truncated += suffix
-    return truncated
+def extract_lec_num(text):
+    if not text: return 9999
+    m = re.search(r'(?:lecture|lec|class)\s*[-–]?\s*(\d+)', text, re.I)
+    if m: return int(m.group(1))
+    m = re.search(r'(?:part|भाग)\s*[-–]?\s*(\d+)', text, re.I)
+    return int(m.group(1)) if m else 9999
 
-# ─────────────────────────────────────────────────────
-# 🔐 PARSE LOGIN RESPONSE
-# ─────────────────────────────────────────────────────
-def parse_login_response(resp_json):
-    message = resp_json.get("message", "")
-    response = resp_json.get("response", "")
-    code = resp_json.get("code")
-    data = resp_json.get("data")
+def is_pdf_test(t):
+    return any(k in (t or "").lower() for k in ['pdf','test','answer','ans','sheet','printable'])
 
-    is_success = False
-    if message and "login successful" in str(message).lower():
-        is_success = True
-    elif str(response) == "1":
-        is_success = True
-    elif (code is True or str(code).lower() == "true") and data:
-        is_success = True
+def extract_subject(full):
+    if not full: return "Other"
+    if is_pdf_test(full): return "📄 PDFs & Tests"
+    m = re.match(r'^(.+?)\s*[-–]\s*(?:Lecture|lec|Class|Part|भाग)', full, re.I)
+    if m: return m.group(1).strip()
+    if '||' in full: return full.split('||')[0].strip()
+    if ':' in full: return full.split(':')[0].strip()
+    return "Other"
 
-    if is_success and data:
-        userid = data.get("id")
-        token = data.get("connection_key")
-        name = data.get("name", "User")
-        if userid and token:
-            return True, str(userid), str(token), str(name), str(message)
-    return False, None, None, None, str(message)
+def _sort_groups(groups):
+    result, pdfs = [], groups.get("📄 PDFs & Tests", [])
+    for name in sorted(k for k in groups if k != "📄 PDFs & Tests"):
+        entries = groups[name]
+        vids = sorted([e for e in entries if not e[2]], key=lambda x: x[1])
+        pdfs_only = sorted([e for e in entries if e[2]], key=lambda x: x[0].lower())
+        result.extend([e[0] for e in vids + pdfs_only])
+    if pdfs:
+        result.extend([e[0] for e in sorted(pdfs, key=lambda x: x[0].lower())])
+    return result
 
-# ─────────────────────────────────────────────────────
-# 🔐 TWO-STEP LOGIN — WITH BETTER ERROR HANDLING ✅
-# ─────────────────────────────────────────────────────
-def login(mob, pwd):
+# ================== API FUNCTIONS ==================
+def login_api(phone, pwd, sess):
+    payload = {"phone": str(phone).strip(), "password": str(pwd).strip(), "remember": True}
     try:
-        password_hash = hashlib.sha512(pwd.encode()).hexdigest()
-        payload1 = {
-            "code": "", "valid_id": "", "api_key": API_KEY,
-            "mobilenumber": mob, "password": password_hash
-        }
-        session = requests.Session()
-        resp1 = session.post(LOGIN_URL, headers=HEADERS, json=payload1, timeout=15, verify=False)
-        
-        # ✅ Check if response is HTML error page
-        if not resp1.text.strip() or resp1.text.strip().startswith("<!DOCTYPE") or resp1.text.strip().startswith("<html"):
-            print(f"{R}❌ API returned HTML error page (server issue){W}")
-            return None, None, None, None, "Server error - try again later"
-        
-        try:
-            resp1_json = resp1.json()
-        except Exception as e:
-            print(f"{R}❌ Invalid JSON response: {e}{W}")
-            print(f"Response text: {resp1.text[:200]}")
-            return None, None, None, None, "Invalid server response"
+        r = sess.post(f"{API_BASE}/cms/login?medium=0", headers=HEADERS, json=payload, timeout=20)
+        txt = smart_decompress(r.content)
+        if r.status_code == 422:
+            try: return None, json.loads(txt).get('message', 'Validation failed')
+            except: return None, "Validation error"
+        if r.status_code != 200: return None, f"Status {r.status_code}"
+        data = json.loads(txt)
+        token = data.get("token") or data.get("access_token") or (data.get("data") or {}).get("token")
+        return (token, None) if token else (None, "Token not found")
+    except Exception as e: return None, str(e)
 
-        success1, uid1, tok1, name1, msg1 = parse_login_response(resp1_json)
-        if success1:
-            return uid1, tok1, name1, session, None
-
-        valid_id = resp1_json.get("valid_id")
-        if valid_id and resp1_json.get("response") == "0":
-            payload2 = payload1.copy()
-            payload2["valid_id"] = valid_id
-            resp2 = session.post(LOGIN_URL, headers=HEADERS, json=payload2, timeout=15, verify=False)
-            
-            if not resp2.text.strip() or resp2.text.strip().startswith("<!DOCTYPE"):
-                return None, None, None, None, "Server error - try again later"
-            
-            try:
-                resp2_json = resp2.json()
-            except:
-                return None, None, None, None, "Invalid server response"
-            
-            success2, userid, token, name, message = parse_login_response(resp2_json)
-            if success2:
-                return userid, token, name, session, None
-            else:
-                return None, None, None, None, message or "Login failed"
-        
-        return None, None, None, None, msg1 or "Login failed"
+def get_courses_api(sess, token):
+    headers = {**HEADERS, "authorization": f"Bearer {token}"}
+    try:
+        r = sess.get(f"{API_BASE}/v1/courses/paid", headers=headers, timeout=15)
+        if r.status_code == 200:
+            data = json.loads(smart_decompress(r.content))
+            if isinstance(data, list): return data
     except Exception as e:
-        traceback.print_exc()
-        return None, None, None, None, str(e)
+        print(f"[API] get_courses: {e}")
+    return []
 
-# ─────────────────────────────────────────────────────
-# 💰 GET PRICE
-# ─────────────────────────────────────────────────────
-def get_price(item):
-    price_fields = ["price", "batch_price", "selling_price", "discounted_price", "final_price"]
-    mrp_fields = ["mrp", "original_price", "marked_price", "list_price"]
-    price = mrp = 0
-    for field in price_fields:
-        val = item.get(field)
-        if val not in [None, '', '0']:
-            try:
-                price = int(float(str(val).replace(",", "").replace("₹", "").strip()))
-                break
-            except: pass
-    for field in mrp_fields:
-        val = item.get(field)
-        if val not in [None, '', '0']:
-            try:
-                mrp = int(float(str(val).replace(",", "").replace("₹", "").strip()))
-                break
-            except: pass
-    return price, mrp
-
-# ─────────────────────────────────────────────────────
-# 📅 FORMAT DATE
-# ─────────────────────────────────────────────────────
-def format_purchase_date(purchase_date):
-    if not purchase_date:
-        return "N/A"
+def get_lessons_api(sess, slug, token):
+    headers = {**HEADERS, "authorization": f"Bearer {token}"}
+    url = f"{API_BASE}/cms/user/courses/{slug}/lessons?medium=0"
     try:
-        if isinstance(purchase_date, (int, float)) and purchase_date > 1e12:
-            return datetime.fromtimestamp(purchase_date/1000).strftime("%Y-%m-%d")
-        elif isinstance(purchase_date, (int, float)):
-            return datetime.fromtimestamp(purchase_date).strftime("%Y-%m-%d")
-        elif isinstance(purchase_date, str):
-            for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%Y-%m-%d %H:%M:%S"):
-                try:
-                    return datetime.strptime(purchase_date, fmt).strftime("%Y-%m-%d")
-                except: continue
-    except: pass
-    return str(purchase_date)[:20]
-
-# ─────────────────────────────────────────────────────
-# 📦 FETCH COURSES
-# ─────────────────────────────────────────────────────
-def get_courses(session, userid, token):
-    try:
-        url = f"{COURSES_URL}/{token}/{userid}/4"
-        resp = session.get(url, headers=HEADERS, timeout=15, verify=False)
+        r = sess.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            data = json.loads(smart_decompress(r.content))
+            if isinstance(data, dict):
+                if 'lessons' in data: return data
+                if 'data' in data and isinstance(data['data'], dict): return data['data']
+    except Exception as e:
+        print(f"[API] lessons ({slug}): {e}")
         
-        # Check for HTML error
-        if not resp.text.strip() or resp.text.strip().startswith("<!DOCTYPE"):
-            return []
+    try:
+        r2 = sess.get(f"{API_BASE}/courses/{slug}/pdfs?groupBy=topic", headers=headers, timeout=15)
+        if r2.status_code == 200:
+            data = json.loads(smart_decompress(r2.content))
+            if isinstance(data, dict) and data.get('state') == 200:
+                return {"topics": data.get('data', {}).get('topics', [])}
+    except Exception as e:
+        print(f"[API] pdfs ({slug}): {e}")
+    return {}
+
+def extract_urls(data, batch, thumb):
+    groups = defaultdict(list)
+    if not data: return [], thumb
+    prefix = get_short_subject(batch)
+    topics = data.get('topics') or data.get('pdfs') or []
+    if topics and not data.get('lessons'):
+        for topic in topics:
+            if not isinstance(topic, dict): continue
+            tname = topic.get('topic', {}).get('topicName') or topic.get('section', {}).get('sectionName') or 'Sheet'
+            for pdf in topic.get('pdfs', []):
+                if not isinstance(pdf, dict): continue
+                url = pdf.get('uploadPdf') or pdf.get('url')
+                if url:
+                    title = clean_title(pdf.get('title', 'PDF'), batch)
+                    full = f"{tname} - {title}"
+                    groups["📄 PDFs & Tests"].append((f"[{prefix}] {full} : {url}", extract_lec_num(full), True))
+        return _sort_groups(groups), thumb
         
-        resp_json = resp.json()
-        if isinstance(resp_json, list) and len(resp_json) > 0:
-            courses = []
-            for item in resp_json:
-                purchase_date = item.get("purchase_date") or item.get("created_date") or item.get("date") or item.get("created_at")
-                days_remaining = item.get("days_remaining") or item.get("remaining_days") or item.get("validity_days") or item.get("days_left") or 0
-                try: days_remaining = int(days_remaining)
-                except: days_remaining = 0
-                is_expired = item.get("is_expired") or item.get("expired") or item.get("is_over") or (days_remaining <= 0)
-                course = {
-                    "course_id": str(item.get("course_id", "")),
-                    "batch_id": str(item.get("batch_id", "")),
-                    "batch_name": item.get("batch_name", "Unknown"),
-                    "image": item.get("banner_image_name") or item.get("course_image") or "",
-                    "purchase_date": purchase_date,
-                    "days_remaining": days_remaining,
-                    "is_expired": bool(is_expired),
-                }
-                courses.append(course)
-            return courses
-        return []
-    except Exception:
-        traceback.print_exc()
-        return []
+    lessons = data.get('lessons') or (data.get('data') or {}).get('lessons') or []
+    if not isinstance(lessons, list): return [], thumb
+    for lesson in lessons:
+        if not isinstance(lesson, dict): continue
+        lname = clean_title(lesson.get('name') or lesson.get('title') or 'Lesson', batch)
+        for vid in (lesson.get('videos') or lesson.get('class_videos') or []):
+            if not isinstance(vid, dict): continue
+            vname = clean_title(vid.get('name') or vid.get('title') or 'Video', batch)
+            url = vid.get('video_url') or vid.get('url') or vid.get('class_link')
+            if url:
+                full = f"{lname} - {vname}" if lname != vname else vname
+                groups[extract_subject(full)].append((f"[{prefix}] {full} : {url}", extract_lec_num(full), False))
+        for pdf in (lesson.get('classPdf') or lesson.get('pdfs') or []):
+            if isinstance(pdf, dict) and pdf.get('url'):
+                title = clean_title(pdf.get('title', 'PDF'), batch)
+                full = f"{lname} - {title}"
+                groups[extract_subject(full)].append((f"[{prefix}] {full} : {pdf['url']}", extract_lec_num(full), True))
+    for note in (data.get('notes') or (data.get('data') or {}).get('notes') or []):
+        if isinstance(note, dict) and note.get('video_url'):
+            name = clean_title(note.get('name', 'Note'), batch)
+            groups[extract_subject(name)].append((f"[{prefix}] {name} : {note['video_url']}", extract_lec_num(name), is_pdf_test(name)))
+    return _sort_groups(groups), thumb
 
-# ─────────────────────────────────────────────────────
-# 🌐 SAFE REQUEST
-# ─────────────────────────────────────────────────────
-def safe_get(session, url, headers, timeout=15, max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            return session.get(url, headers=headers, timeout=timeout, verify=False)
-        except requests.exceptions.ConnectionError:
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
-            else:
-                return None
-        except:
-            return None
-    return None
+def save_txt(urls, batch, thumb):
+    name = re.sub(r'[\\/:*?"<>|\n\r]', '_', batch).strip()[:40]
+    path = os.path.join(tempfile.gettempdir(), f"{name}_{datetime.now().strftime('%Y%m%d_%H%M')}.txt")
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(f"[{batch}] Thumbnail : {thumb}\n\n")
+        for u in urls: f.write(u + '\n')
+    return path
 
-# ─────────────────────────────────────────────────────
-# 🎬 EXTRACT CONTENT
-# ─────────────────────────────────────────────────────
-def extract_content(session, userid, token, batch_id, course_id, course_name, course_image):
-    content = []
-    try:
-        subjects_url = f"{SUBJECTS_URL}/{token}/{userid}/{course_id}/{batch_id}"
-        subjects_resp = safe_get(session, subjects_url, HEADERS)
-        if not subjects_resp:
-            return []
-        try: subjects_data = subjects_resp.json()
-        except: return []
-        if isinstance(subjects_data, dict):
-            subjects = subjects_data.get("subjects", subjects_data.get("data", []))
-        elif isinstance(subjects_data, list):
-            subjects = subjects_data
-        else:
-            subjects = []
-        if not subjects:
-            return []
-        for sub in subjects:
-            sid = sub.get("id")
-            sub_name = sub.get("subject_name", "Unknown")
-            # Videos
-            try:
-                vid_url = f"{VIDEOS_URL}/{token}/{userid}/{course_id}/{batch_id}/0/{sid}/0"
-                videos_resp = safe_get(session, vid_url, HEADERS)
-                if videos_resp and videos_resp.status_code == 200:
-                    videos_data = videos_resp.json()
-                    videos = videos_data.get("videos", videos_data.get("data", [])) if isinstance(videos_data, dict) else (videos_data if isinstance(videos_data, list) else [])
-                    for v in videos:
-                        title = v.get("content_title", "Untitled")
-                        jw_id = v.get("jwplayer_id", "")
-                        if jw_id:
-                            content.append(f"[VIDEO] ({sub_name}) {title} : https://{jw_id}")
-            except: pass
-            # PDFs
-            try:
-                pdf_url = f"{PDFS_URL}/{token}/{userid}/{course_id}/{batch_id}/0/{sid}/0"
-                pdfs_resp = safe_get(session, pdf_url, HEADERS)
-                if pdfs_resp and pdfs_resp.status_code == 200:
-                    pdfs_data = pdfs_resp.json()
-                    pdfs = pdfs_data.get("pdfs", pdfs_data.get("data", [])) if isinstance(pdfs_data, dict) else (pdfs_data if isinstance(pdfs_data, list) else [])
-                    for p in pdfs:
-                        title = p.get("content_title", "Untitled")
-                        file_name = p.get("file_name", "")
-                        if file_name:
-                            content.append(f"[PDF] ({sub_name}) {title} : https://kdcampus.live/uploaded/content_data/{file_name}")
-            except: pass
-            time.sleep(0.15)
-        return content
-    except Exception:
-        traceback.print_exc()
-        return []
-
-# ─────────────────────────────────────────────────────
-# 💾 SAVE TO FILE
-# ─────────────────────────────────────────────────────
-def save_to_file(course_name, course_image, userid_token, content, batch_id="", expiry_date="N/A"):
-    if not content:
-        return None
-    safe_name = re.sub(r'[<>:"/\\|?*]', "_", course_name).strip()
-    short_name = safe_name[:28].strip()
-    filename = f"KDLive_{short_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    image_url = safe_thumb_url(course_image)
-    try:
-        with open(filename, "w", encoding="utf-8") as f:
-            if image_url:
-                f.write(f"🖼 Batch Thumbnail : {image_url}\n\n")
-            f.write("======== ALL LINKS ========\n\n")
-            for item in content:
-                f.write(item + "\n")
-        return filename
-    except Exception:
-        traceback.print_exc()
-        return None
-
-# ─────────────────────────────────────────────────────
-# 🧾 BUILD COURSE HTML — LIMITED DISPLAY ✅
-# ─────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────
-# 🧾 BUILD COURSE HTML — COMPACT VERSION
-# ─────────────────────────────────────────────────────
-def build_course_list_html(courses, max_display=15):
-    """Build compact course list with blockquotes"""
-    parts = []
-    parts.append("📚 <b>List of Batches You Have :</b>\n")
+# ================== KEYBOARD & MENU ==================
+def build_kb(courses, selected):
+    kb = []
+    for c in courses:
+        is_sel = c['id'] in selected
+        kb.append([InlineKeyboardButton(f"{'✅' if is_sel else '▫️'} {c['title'][:40]}", callback_data=f"tgl_{c['id']}")])
     
-    total = len(courses)
-    display_courses = courses[:max_display]
+    all_sel = len(selected) == len(courses)
+    kb.append([InlineKeyboardButton("❌ Deselect All" if all_sel else "✅ Select All", callback_data="unsel_all" if all_sel else "sel_all")])
+    kb.append([
+        InlineKeyboardButton("📥 Export All", callback_data="exp_all"),
+        InlineKeyboardButton("✅ Done", callback_data="done")
+    ])
+    return InlineKeyboardMarkup(kb)
+
+async def show_menu(client, uid):
+    if uid not in user_sessions: return
+    sess = user_sessions[uid]
+    courses, selected = sess['courses'], sess.get('selected', [])
+    creds = sess.get('creds_raw', '')
     
-    for c in display_courses:
-        batch_id = h(c.get("batch_id", ""))
-        batch_name = h(c.get("batch_name", "Unknown"))
-        thumb = safe_thumb_url(c.get("image", ""))
-        days_remaining = c.get("days_remaining", 0)
-        is_expired = c.get("is_expired", False)
-        
-        # Compact format - single line per batch
-        if is_expired or days_remaining <= 0:
-            batch_info = f"📦 {batch_id} | {batch_name} | ⌛ EXPIRED"
+    text = f"🔐 **Credentials:**\n```\n{creds}\n```\n\n📚 **Your Courses:**\n\n"
+    
+    for c in courses:
+        thumb_url = fix_thumb(c.get('image', {}).get('large') or c.get('image', {}).get('medium'))
+        thumb_link = f"[🔗 Thumbnail]({thumb_url})" if thumb_url else ""
+        text += f"`{c['id']}` - {c['title']}\n{thumb_link}\n\n"
+    
+    text = text.strip()
+    kb = build_kb(courses, selected)
+    msg_id = sess.get('menu_msg_id')
+    
+    try:
+        if msg_id:
+            await client.edit_message_text(uid, msg_id, text, reply_markup=kb, parse_mode=enums.ParseMode.MARKDOWN, disable_web_page_preview=True)
         else:
-            batch_info = f"📦 {batch_id} | {batch_name} | ⌛ {days_remaining} days"
+            msg = await client.send_message(uid, text, reply_markup=kb, parse_mode=enums.ParseMode.MARKDOWN, disable_web_page_preview=True)
+            sess['menu_msg_id'] = msg.id
+    except Exception as e:
+        if msg_id:
+            try: await client.delete_messages(uid, msg_id)
+            except: pass
+        msg = await client.send_message(uid, text, reply_markup=kb, parse_mode=enums.ParseMode.MARKDOWN, disable_web_page_preview=True)
+        sess['menu_msg_id'] = msg.id
+
+# ================== BOT HANDLERS ==================
+@app.on_message(filters.command("start"))
+async def cmd_start(_, m):
+    await m.reply(
+        "🎓 **Khan Global Studies Bot**\n\n"
+        "🔑 Login karein:\n"
+        "```\n9876543210*yourpassword\n```\n"
+        "Ya phir seedha **Token** paste karein.\n\n"
+        "✅ Features:\n"
+        "• Ek hi message me selection\n"
+        "• Credentials copyable + Thumbnail link\n"
+        "• Done dabane pe Photo → Details → TXT\n"
+        "• Progress msg turant delete ho jata hai",
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
+
+@app.on_message(filters.text & ~filters.command(["start"]))
+async def handle_text(client, m):
+    uid = m.from_user.id
+    txt = m.text.strip()
+    if not txt: return
+
+    # 🔒 STRICT: Sirf login format pe hi kaam karega. Baaki sab ignore.
+    if "*" in txt or len(txt) > 35:
+        if uid in user_sessions:
+            del user_sessions[uid]
+        await process_login(client, m, uid, txt)
+    # ❌ Random text pe KUCH NAHI hoga (No reply, No loop)
+
+async def process_login(client, m, uid, txt):
+    prog = await m.reply("🔐 Processing login...")
+    token, creds_raw = None, ""
+    req_sess = requests.Session()
+
+    if "*" in txt:
+        phone, pwd = txt.split("*", 1)
+        phone, pwd = phone.strip(), pwd.strip()
+        token, err = login_api(phone, pwd, req_sess)
+        if err:
+            await prog.edit(f"❌ Login failed: {err}")
+            return
+        creds_raw = f"{phone}*{pwd}"
+    else:
+        token = txt.strip()
+        req_sess.cookies.set('AUTH_USER', json.dumps({"token": f"0|{token}", "user": {}}), domain='.khanglobalstudies.com')
+        creds_raw = token
+
+    await prog.edit("✅ Login successful! Fetching courses...")
+    courses = get_courses_api(req_sess, token)
+    if not courses:
+        await prog.edit("⚠️ No courses found. Check credentials or close Khan App.")
+        return
+
+    user_sessions[uid] = {
+        'token': token,
+        'sess': req_sess,
+        'courses': courses,
+        'selected': [],
+        'creds_raw': creds_raw,
+        'menu_msg_id': None
+    }
+    await prog.delete()
+    await show_menu(client, uid)
+
+@app.on_callback_query(filters.regex(r"^tgl_"))
+async def cb_toggle(_, cq):
+    uid = cq.from_user.id
+    if uid not in user_sessions: return await cq.answer("⚠️ Session expired. Login again.", show_alert=True)
+    course_id = int(cq.data.split("_")[1])
+    sess = user_sessions[uid]
+    sel = sess.get('selected', [])
+    if course_id in sel:
+        sel.remove(course_id)
+        await cq.answer("▫️ Deselected")
+    else:
+        sel.append(course_id)
+        await cq.answer("✅ Selected")
+    sess['selected'] = sel
+    await show_menu(_, uid)
+
+@app.on_callback_query(filters.regex(r"^(sel_all|unsel_all)$"))
+async def cb_all(_, cq):
+    uid = cq.from_user.id
+    if uid not in user_sessions: return await cq.answer("⚠️ Session expired.", show_alert=True)
+    sess = user_sessions[uid]
+    if cq.data == "sel_all":
+        sess['selected'] = [c['id'] for c in sess['courses']]
+        await cq.answer("✅ All selected")
+    else:
+        sess['selected'] = []
+        await cq.answer("❌ All deselected")
+    await show_menu(_, uid)
+
+@app.on_callback_query(filters.regex(r"^exp_all$"))
+async def cb_exp_all(_, cq):
+    uid = cq.from_user.id
+    if uid not in user_sessions: return await cq.answer("⚠️ Session expired.", show_alert=True)
+    await cq.answer("🚀 Exporting all courses...")
+    sess = user_sessions[uid]
+    for c in sess['courses']:
+        await export_course(_, uid, c, sess['sess'], sess['token'])
+        await asyncio.sleep(3)
+
+@app.on_callback_query(filters.regex(r"^done$"))
+async def cb_done(_, cq):
+    uid = cq.from_user.id
+    if uid not in user_sessions: return await cq.answer("⚠️ Session expired.", show_alert=True)
+    sess = user_sessions[uid]
+    selected = sess.get('selected', [])
+    if not selected: return await cq.answer("⚠️ Pehle koi batch select karein!", show_alert=True)
+    await cq.answer(f"🚀 Exporting {len(selected)} batch(es)...")
+    for c in sess['courses']:
+        if c['id'] in selected:
+            await export_course(_, uid, c, sess['sess'], sess['token'])
+            await asyncio.sleep(3)
+
+async def export_course(client, uid, course, req_sess, token):
+    title = course.get('title', 'Course')
+    slug = course.get('slug')
+    thumb = fix_thumb(course.get('image', {}).get('large') or course.get('image', {}).get('medium'))
+    
+    if not slug:
+        await client.send_message(uid, f"⚠️ Skipping {title} (no slug)")
+        return
+    
+    prog = await client.send_message(uid, f"⏳ Fetching: {title}...")
+    try:
+        data = get_lessons_api(req_sess, slug, token)
+        if not data:
+            await prog.delete()
+            await client.send_message(uid, f"⚠️ No data for {title}.")
+            return
+            
+        urls, bthumb = extract_urls(data, title, thumb)
+        if not urls:
+            await prog.delete()
+            await client.send_message(uid, f"⚠️ No URLs found in {title}")
+            return
+            
+        path = save_txt(urls, title, bthumb or thumb)
+        caption = f"📚 **{title}**\n🔗 Links: `{len(urls)}`\n📄 Format: Grouped + Sorted"
         
         if thumb:
-            batch_info += f' | 🖼 <a href="{h(thumb)}">Thumb</a>'
-        
-        parts.append(quote_box(batch_info))
-    
-    if total > max_display:
-        remaining = total - max_display
-        parts.append(f"\n<i>... and {remaining} more. Use buttons below 👇</i>")
-    
-    parts.append("\n👇 Niche buttons se batch select karo")
-    return "\n".join(parts)  # Single \n instead of \n\n for less spacing
-# ─────────────────────────────────────────────────────
-# 🔘 BUTTONS
-# ─────────────────────────────────────────────────────
-def build_course_buttons(courses):
-    rows = []
-    for idx, c in enumerate(courses, 1):
-        name = c.get("batch_name", "Unknown")
-        short_name = name[:45] + "..." if len(name) > 45 else name
-        rows.append([InlineKeyboardButton(short_name, callback_data=f"extract::{idx-1}")])
-    return InlineKeyboardMarkup(rows)
-
-# ─────────────────────────────────────────────────────
-# 🤖 HANDLERS
-# ─────────────────────────────────────────────────────
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "🎬 <b>KDLIVE EXTRACTOR BOT</b>\n\n"
-        "Send credentials in any one format:\n"
-        "1. <code>ID*Password</code>\n"
-        "2. <code>userid|token</code>\n\n"
-        "Example:\n"
-        "<pre>9163xxxxxx*anil@xxx</pre>"
-        "<pre>4401xx|3a9xxc0axx67d1ccccbxxxbe4c3ee6b6</pre>"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
-
-async def handle_credentials(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.effective_user:
-        return
-    user_id = update.effective_user.id
-    cred_input = update.message.text.strip()
-    userid = token = None
-    name = "User"
-    session = requests.Session()
-    wait_msg = await update.message.reply_text("🔄 Processing...")
-    
-    if "|" in cred_input and "*" not in cred_input:
-        parts = cred_input.split("|", 1)
-        if len(parts) == 2:
-            userid, token = parts[0].strip(), parts[1].strip()
+            try:
+                await client.send_photo(uid, thumb, caption=caption, parse_mode=enums.ParseMode.MARKDOWN)
+            except:
+                await client.send_message(uid, caption, parse_mode=enums.ParseMode.MARKDOWN)
         else:
-            await wait_msg.edit_text("❌ Invalid token format")
-            return
-    elif "*" in cred_input:
-        mob, pwd = cred_input.split("*", 1)
-        mob, pwd = mob.strip(), pwd.strip()
-        if not mob or not pwd:
-            await wait_msg.edit_text("❌ Empty credentials")
-            return
-        userid, token, name, session, error = login(mob, pwd)
-        if not userid or not token:
-            # ✅ Use reply_text instead of edit_text to avoid "message not found" error
-            await wait_msg.delete()
-            await update.message.reply_text(f"❌ Login failed: {error or 'Invalid credentials'}\n\n<i>Server may be busy. Try again in 1-2 minutes.</i>", parse_mode=ParseMode.HTML)
-            return
-    else:
-        await wait_msg.edit_text("❌ Invalid format\nUse:\nID*Password\nor\nuserid|token")
-        return
-    
-    userid_token = f"{userid}|{token}"
-    courses = get_courses(session, userid, token)
-    if not courses:
-        await wait_msg.delete()
-        await update.message.reply_text("⚠️ No courses found\n\n<i>Server may be busy or account has no active batches.</i>", parse_mode=ParseMode.HTML)
-        return
-    
-    USERS[user_id] = {
-        "userid": userid, "token": token, "name": name,
-        "session": session, "userid_token": userid_token, "courses": courses,
-    }
-    
-    # Build final HTML message
-    final_html = (
-        "📱 <b>App Name: KD-Live</b>\n\n"
-        "✅ <b>Logged in Successfully</b> 👨‍💻 with 🔑 Credential :\n\n"
-        f"{pre_box(cred_input)}"
-        "👤 <b>UserId | Token</b>\n"
-        f"{pre_box(userid_token)}\n\n"
-        f"{build_course_list_html(courses)}"
-    )
-    
-    # Safe truncate HTML
-    final_html = safe_truncate_html(final_html, max_len=3800)
-    
-    thumb = safe_thumb_url(courses[0].get("image", "")) if courses else ""
-    reply_markup = build_course_buttons(courses)
-    
-    # ✅ Delete wait_msg first, then send new message (avoids edit errors)
-    try:
-        await wait_msg.delete()
-    except:
-        pass
-    
-    # Try send with photo
-    media_sent = False
-    if thumb:
-        try:
-            await update.message.reply_photo(
-                photo=thumb, caption=final_html,
-                parse_mode=ParseMode.HTML, reply_markup=reply_markup
-            )
-            media_sent = True
-        except Exception as e:
-            print(f"⚠️ Photo send failed: {e}")
-            media_sent = False
-    
-    # Fallback: send as text
-    if not media_sent:
-        try:
-            await update.message.reply_text(
-                final_html, parse_mode=ParseMode.HTML, reply_markup=reply_markup
-            )
-        except Exception as e:
-            print(f"⚠️ Text send failed: {e}")
-            # Last resort: send batches as document
-            await update.message.reply_text("⚠️ Too many batches! Sending list as file...")
-            batch_list = "\n".join([
-                f"{c.get('batch_name')}: {c.get('days_remaining', 0)} days"
-                for c in courses[:50]
-            ])
-            batch_file = f"batches_{userid}_{int(time.time())}.txt"
-            with open(batch_file, "w", encoding="utf-8") as f:
-                f.write(f"User: {userid_token}\nTotal Batches: {len(courses)}\n\n{batch_list}")
-            await update.message.reply_document(
-                document=batch_file,
-                caption=f"📋 All {len(courses)} batches (file attached)\n👇 Use buttons to extract"
-            )
-            try: os.remove(batch_file)
-            except: pass
-
-async def handle_course_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not query.from_user:
-        return
-    user_id = query.from_user.id
-    user_data = USERS.get(user_id)
-    if not user_data:
-        try:
-            await query.edit_message_caption(caption="❌ Session expired. Send credentials again.")
-        except:
-            await query.message.reply_text("❌ Session expired. Send credentials again.")
-        return
-    try:
-        idx = int(query.data.split("::", 1)[1])
-    except:
-        try:
-            await query.edit_message_caption(caption="❌ Invalid selection")
-        except:
-            await query.message.reply_text("❌ Invalid selection")
-        return
-    courses = user_data.get("courses", [])
-    if idx < 0 or idx >= len(courses):
-        try:
-            await query.edit_message_caption(caption="❌ Invalid course index")
-        except:
-            await query.message.reply_text("❌ Invalid course index")
-        return
-    selected = courses[idx]
-    course_id = selected.get("course_id", "")
-    batch_id = selected.get("batch_id", "")
-    course_name = selected.get("batch_name", "Unknown_Course")
-    course_image = selected.get("image", "")
-    purchase_date = format_purchase_date(selected.get("purchase_date"))
-    
-    # ✅ Use reply_text instead of edit to avoid errors
-    try:
-        await query.edit_message_caption(caption=f"⏳ Extracting...\n\n📘 {course_name}", reply_markup=None)
-    except:
-        try:
-            await query.message.reply_text(f"⏳ Extracting...\n\n📘 {course_name}")
-        except:
-            pass
-    
-    content = extract_content(user_data["session"], user_data["userid"], user_data["token"],
-                              batch_id, course_id, course_name, course_image)
-    if not content:
-        await query.message.reply_text("⚠️ No content extracted.\n\n<i>Course may be empty or server error.</i>", parse_mode=ParseMode.HTML)
-        return
-    
-    filename = save_to_file(course_name, course_image, user_data["userid_token"], content,
-                            batch_id=batch_id, expiry_date=purchase_date)
-    if not filename or not os.path.exists(filename):
-        await query.message.reply_text("❌ Failed to save TXT file")
-        return
-    
-    total_videos = sum(1 for x in content if x.startswith("[VIDEO]"))
-    total_pdfs = sum(1 for x in content if x.startswith("[PDF]"))
-    thumb = safe_thumb_url(course_image)
-    
-    batch_details = [
-        f"🏷 Batch Id : {h(batch_id)}",
-        f"📚 Batch Name : {h(course_name)}",
-        f"🗓 Expiry Date : {h(purchase_date)}",
-        f'🖼 Batch Thumbnail : <a href="{h(thumb)}">Thumbnail</a>' if thumb else "🖼 Batch Thumbnail : N/A"
-    ]
-    summary_details = [
-        f"🔢 Total Number of Links : {len(content)}",
-        f"🎥 Total Videos : {total_videos}",
-        f"📄 Total PDFs : {total_pdfs}"
-    ]
-    caption_lines = [
-        "📱 <b>App Name: KD-Live</b>", "",
-        "======= BATCH DETAILS =======", "",
-        "\n".join(batch_details), "",
-        "======== <b>LINK SUMMARY</b> ========", "",
-        "\n".join(summary_details), "",
-        f"🕒 <b>Generated On</b> : {h(datetime.now().strftime('%d-%m-%Y %I:%M:%S %p'))}"
-    ]
-    caption = "\n".join(caption_lines)
-    if len(caption) > 1000:
-        caption = caption[:1000]
-    
-    with open(filename, "rb") as f:
-        await query.message.reply_document(
-            document=f, filename=os.path.basename(filename),
-            caption=caption, parse_mode=ParseMode.HTML
-        )
-    try: os.remove(filename)
-    except: pass
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    print("⚠️ Bot Error:")
-    traceback.print_exception(None, context.error, context.error.__traceback__)
-
-# ─────────────────────────────────────────────────────
-# 🚀 MAIN
-# ─────────────────────────────────────────────────────
-def main():
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN env variable not set")
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_error_handler(error_handler)
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(handle_course_select, pattern=r"^extract::"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_credentials))
-    print("🚀 Bot running...")
-    app.run_polling()
-
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print(f"\n\n⚠️ Stopped by user\n")
+            await client.send_message(uid, caption, parse_mode=enums.ParseMode.MARKDOWN)
+            
+        await client.send_document(uid, path, caption=f"📄 {title[:30]}.txt")
+        
+        # 🗑️ TURANT DELETE
+        await prog.delete()
+        if os.path.exists(path): os.remove(path)
     except Exception as e:
-        print(f"\n❌ Fatal Error: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"[Export Error] {title}:\n{traceback.format_exc()}")
+        await prog.edit(f"❌ Error: {e}")
+
+# ================== RUN ==================
+if __name__ == "__main__":
+    print("🟢 Khan Bot Starting...")
+    print(f"   API_ID: {API_ID}")
+    print(f"   Bot: @{app.me.username if app.me else 'Unknown'}")
+    app.run()
