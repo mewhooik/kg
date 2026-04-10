@@ -1,6 +1,4 @@
+# requirements.txt
+pyrogram==2.0.106
+TgCrypto
 requests
-aiohttp
-pycryptodome
-python-telegram-bot
-pymongo
-dnspython
